@@ -7,9 +7,11 @@ import { useQuiz } from '../context/QuizContext';
 export default function AnalyticsDashboard() {
   const { history, fetchHistory } = useQuiz();
 
+  // fetchHistory is stable (useCallback with no deps) so listing it here
+  // satisfies the exhaustive-deps lint rule without causing extra fetches.
   useEffect(() => {
     fetchHistory();
-  }, []);
+  }, [fetchHistory]);
 
   if (!history || history.length === 0) {
     return (

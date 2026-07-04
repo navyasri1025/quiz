@@ -1,6 +1,5 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { CheckCircle, XCircle, Circle } from 'lucide-react';
 
 export default function QuestionPalette({ total, current, answers, onSelect }) {
   return (

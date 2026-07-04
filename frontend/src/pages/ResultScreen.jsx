@@ -6,7 +6,7 @@ import Confetti from '../components/Confetti';
 import { useQuiz } from '../context/QuizContext';
 
 export default function ResultScreen() {
-  const { results, resetQuiz } = useQuiz();
+  const { results, resetQuiz, dispatch } = useQuiz();
   const [showConfetti, setShowConfetti] = useState(false);
 
   useEffect(() => {
@@ -141,7 +141,7 @@ export default function ResultScreen() {
             difficulty === 'medium' ? 'bg-yellow-500/15 text-yellow-400' :
             'bg-red-500/15 text-red-400'
           }`}>
-            {difficulty.toUpperCase()}
+            {difficulty?.toUpperCase() ?? 'UNKNOWN'}
           </span>
         </motion.div>
 
@@ -276,6 +276,7 @@ export default function ResultScreen() {
           transition={{ delay: 0.8 }}
           className="flex items-center justify-center gap-4 pb-8"
         >
+          {/* Full reset — go back to upload screen */}
           <button
             onClick={resetQuiz}
             className="btn-secondary flex items-center gap-2"
@@ -283,8 +284,12 @@ export default function ResultScreen() {
             <Upload className="w-4 h-4" />
             Upload New PPT
           </button>
+
+          {/* Soft reset — return to configure screen so the user can
+              adjust difficulty / question count and regenerate without
+              re-uploading the same file */}
           <button
-            onClick={resetQuiz}
+            onClick={() => dispatch({ type: 'SET_SCREEN', payload: 'configure' })}
             className="btn-primary flex items-center gap-2"
           >
             <RotateCcw className="w-4 h-4" />

@@ -1,12 +1,24 @@
+/**
+ * QuizContext.jsx — Global state management for QuizCraft AI.
+ *
+ * The context owns:
+ *   - Screen navigation (upload → configure → generating → quiz → results)
+ *   - Upload, generation, quiz, and results state
+ *   - Quiz history list
+ *
+ * All network calls are delegated to api.js so this file contains no fetch()
+ * calls and no URL strings — pure state + orchestration logic.
+ */
 import React, { createContext, useContext, useReducer, useCallback } from 'react';
+import * as api from '../api';
 
 const QuizContext = createContext(null);
 
 const initialState = {
-  // Screen: 'upload' | 'configure' | 'generating' | 'quiz' | 'results'
-  screen: 'upload',
+  // Current screen in the quiz flow
+  screen: 'upload', // 'upload' | 'configure' | 'generating' | 'quiz' | 'results'
 
-  // Upload
+  // ── Upload ───────────────────────────────────────────────────────────────
   sessionId: null,
   filename: null,
   slideCount: 0,
@@ -15,27 +27,27 @@ const initialState = {
   uploading: false,
   uploadError: null,
 
-  // Configure
+  // ── Configure ────────────────────────────────────────────────────────────
   questionCount: 10,
   difficulty: 'medium',
 
-  // Generating
+  // ── Generating ───────────────────────────────────────────────────────────
   generating: false,
   generationProgress: 0,
   generationStatus: '',
   generationError: null,
 
-  // Quiz
+  // ── Quiz ─────────────────────────────────────────────────────────────────
   questions: [],
   currentQuestion: 0,
   answers: {},
   quizStarted: false,
   quizSubmitted: false,
 
-  // Results
+  // ── Results ──────────────────────────────────────────────────────────────
   results: null,
 
-  // History
+  // ── History ──────────────────────────────────────────────────────────────
   history: [],
   historyLoading: false,
 };
@@ -45,7 +57,7 @@ function quizReducer(state, action) {
     case 'SET_SCREEN':
       return { ...state, screen: action.payload };
 
-    // Upload actions
+    // Upload
     case 'UPLOAD_START':
       return { ...state, uploading: true, uploadError: null };
     case 'UPLOAD_SUCCESS':
@@ -62,20 +74,20 @@ function quizReducer(state, action) {
     case 'UPLOAD_ERROR':
       return { ...state, uploading: false, uploadError: action.payload };
 
-    // Configure actions
+    // Configure
     case 'SET_QUESTION_COUNT':
       return { ...state, questionCount: Math.max(5, Math.min(30, action.payload)) };
     case 'SET_DIFFICULTY':
       return { ...state, difficulty: action.payload };
 
-    // Generation actions
+    // Generation
     case 'GENERATE_START':
       return {
         ...state,
         screen: 'generating',
         generating: true,
         generationProgress: 0,
-        generationStatus: 'Initializing AI engine...',
+        generationStatus: 'Initializing AI engine…',
         generationError: null,
       };
     case 'GENERATE_PROGRESS':
@@ -104,13 +116,16 @@ function quizReducer(state, action) {
         generationError: action.payload,
       };
 
-    // Quiz actions
+    // Quiz interaction
     case 'SET_CURRENT_QUESTION':
       return { ...state, currentQuestion: action.payload };
     case 'SET_ANSWER':
       return {
         ...state,
-        answers: { ...state.answers, [action.payload.questionIndex]: action.payload.answer },
+        answers: {
+          ...state.answers,
+          [action.payload.questionIndex]: action.payload.answer,
+        },
       };
     case 'SUBMIT_QUIZ':
       return { ...state, quizSubmitted: true };
@@ -119,7 +134,7 @@ function quizReducer(state, action) {
     case 'SET_RESULTS':
       return { ...state, results: action.payload, screen: 'results' };
 
-    // Reset
+    // Reset — keeps history so the Analytics tab stays populated.
     case 'RESET':
       return { ...initialState, history: state.history };
 
@@ -137,52 +152,34 @@ function quizReducer(state, action) {
 export function QuizProvider({ children }) {
   const [state, dispatch] = useReducer(quizReducer, initialState);
 
-  const getApiBaseUrl = () => {
-    return import.meta.env.VITE_API_URL || '';
-  };
-
+  // ── uploadFile ──────────────────────────────────────────────────────────
   const uploadFile = useCallback(async (file) => {
     dispatch({ type: 'UPLOAD_START' });
-    const formData = new FormData();
-    formData.append('file', file);
-
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        const text = await res.text();
-        throw new Error(`Server returned HTML instead of JSON. Flask server may not be running. Response: ${text.substring(0, 100)}`);
-      }
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Upload failed');
+      const data = await api.uploadFile(file);
       dispatch({ type: 'UPLOAD_SUCCESS', payload: data });
       return data;
     } catch (err) {
-      const errorMsg = err.message.includes('Failed to fetch')
-        ? 'Cannot connect to server. Make sure Flask backend is running on port 5000.'
-        : err.message;
-      dispatch({ type: 'UPLOAD_ERROR', payload: errorMsg });
+      dispatch({ type: 'UPLOAD_ERROR', payload: err.message });
       throw err;
     }
   }, []);
 
+  // ── generateQuiz ────────────────────────────────────────────────────────
   const generateQuiz = useCallback(async (sessionId, questionCount, difficulty) => {
     dispatch({ type: 'GENERATE_START' });
 
+    // Simulate visual progress steps while the real API call runs in parallel.
     const steps = [
-      { progress: 10, status: 'Analyzing presentation content...' },
-      { progress: 25, status: 'Extracting key concepts and topics...' },
-      { progress: 40, status: 'Sending content to DeepSeek AI...' },
-      { progress: 55, status: 'AI is generating questions...' },
-      { progress: 70, status: 'Validating question quality...' },
-      { progress: 85, status: 'Formatting quiz structure...' },
-      { progress: 95, status: 'Finalizing your quiz...' },
+      { progress: 10, status: 'Analyzing presentation content…' },
+      { progress: 25, status: 'Extracting key concepts…' },
+      { progress: 40, status: 'Sending content to DeepSeek AI…' },
+      { progress: 55, status: 'AI is generating questions…' },
+      { progress: 70, status: 'Validating question quality…' },
+      { progress: 85, status: 'Formatting quiz structure…' },
+      { progress: 95, status: 'Finalizing your quiz…' },
     ];
 
-    // Run progress simulation in parallel with the actual API call
     const progressPromise = (async () => {
       for (const step of steps) {
         dispatch({ type: 'GENERATE_PROGRESS', payload: step });
@@ -191,67 +188,49 @@ export function QuizProvider({ children }) {
     })();
 
     try {
-      // Run actual API call in parallel
-      const res = await fetch(`${getApiBaseUrl()}/api/generate-quiz`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, question_count: questionCount, difficulty }),
-      });
-      
-      // Wait for progress simulation to catch up
+      const data = await api.generateQuiz(sessionId, questionCount, difficulty);
+
+      // Let the progress animation finish before revealing the quiz screen.
       await progressPromise;
-      
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        const text = await res.text();
-        throw new Error(`Server returned HTML. Flask backend may not be running.`);
-      }
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Generation failed');
-      dispatch({ type: 'GENERATE_PROGRESS', payload: { progress: 100, status: 'Quiz generated successfully!' } });
+
+      dispatch({
+        type: 'GENERATE_PROGRESS',
+        payload: { progress: 100, status: 'Quiz generated successfully!' },
+      });
       setTimeout(() => {
         dispatch({ type: 'GENERATE_SUCCESS', payload: data });
       }, 500);
+
       return data;
     } catch (err) {
-      const errorMsg = err.message.includes('Failed to fetch')
-        ? 'Cannot connect to Flask server. Make sure it is running on port 5000.'
-        : err.message;
-      dispatch({ type: 'GENERATE_ERROR', payload: errorMsg });
+      dispatch({ type: 'GENERATE_ERROR', payload: err.message });
       throw err;
     }
   }, []);
 
+  // ── submitQuiz ──────────────────────────────────────────────────────────
   const submitQuiz = useCallback(async (sessionId, answers) => {
-    try {
-      const res = await fetch(`${getApiBaseUrl()}/api/submit-quiz`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, answers }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Submission failed');
-      dispatch({ type: 'SET_RESULTS', payload: data });
-      dispatch({ type: 'SUBMIT_QUIZ' });
-      return data;
-    } catch (err) {
-      throw err;
-    }
+    const data = await api.submitQuiz(sessionId, answers);
+    dispatch({ type: 'SET_RESULTS', payload: data });
+    dispatch({ type: 'SUBMIT_QUIZ' });
+    return data;
   }, []);
 
+  // ── fetchHistory ────────────────────────────────────────────────────────
   const fetchHistory = useCallback(async () => {
     dispatch({ type: 'SET_HISTORY_LOADING', payload: true });
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/history`);
-      const data = await res.json();
-      dispatch({ type: 'SET_HISTORY', payload: data.history || [] });
-    } catch {
-      // Silent fail
+      const data = await api.fetchHistory();
+      dispatch({ type: 'SET_HISTORY', payload: data.history ?? [] });
+    } catch (err) {
+      // Non-fatal: log silently so the app still works offline.
+      console.warn('[QuizContext] fetchHistory failed:', err.message);
     } finally {
       dispatch({ type: 'SET_HISTORY_LOADING', payload: false });
     }
   }, []);
 
+  // ── resetQuiz ───────────────────────────────────────────────────────────
   const resetQuiz = useCallback(() => {
     dispatch({ type: 'RESET' });
   }, []);
@@ -271,6 +250,6 @@ export function QuizProvider({ children }) {
 
 export function useQuiz() {
   const ctx = useContext(QuizContext);
-  if (!ctx) throw new Error('useQuiz must be used within QuizProvider');
+  if (!ctx) throw new Error('useQuiz must be used within a QuizProvider');
   return ctx;
 }

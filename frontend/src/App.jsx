@@ -52,9 +52,7 @@ function Sidebar({ activeTab, setActiveTab }) {
             >
               <tab.icon className="w-5 h-5" />
               <span>{tab.label}</span>
-              {isActive && (
-                <ChevronRight className="w-4 h-4 ml-auto" />
-              )}
+              {isActive && <ChevronRight className="w-4 h-4 ml-auto" />}
             </button>
           );
         })}
@@ -90,13 +88,7 @@ function MobileHeader() {
 function MainContent({ activeTab, setActiveTab }) {
   const { screen } = useQuiz();
 
-  const renderScreen = () => {
-    // If not on quiz tab, render the selected tab content
-    if (activeTab !== 'quiz') {
-      return null;
-    }
-
-    // Quiz flow screens
+  const renderQuizScreen = () => {
     switch (screen) {
       case 'upload':
         return <UploadScreen />;
@@ -113,13 +105,6 @@ function MainContent({ activeTab, setActiveTab }) {
     }
   };
 
-  const renderTabContent = () => {
-    if (activeTab === 'quiz') return null;
-    if (activeTab === 'history') return <QuizHistory />;
-    if (activeTab === 'analytics') return <AnalyticsDashboard />;
-    return null;
-  };
-
   return (
     <div className="md:pl-64 pt-16 md:pt-0">
       <AnimatePresence mode="wait">
@@ -131,7 +116,7 @@ function MainContent({ activeTab, setActiveTab }) {
           transition={{ duration: 0.2 }}
         >
           {activeTab === 'quiz' ? (
-            renderScreen()
+            renderQuizScreen()
           ) : (
             <div className="p-4 md:p-8 max-w-5xl mx-auto">
               <h2 className="text-2xl font-bold text-white mb-6 capitalize">
@@ -147,7 +132,15 @@ function MainContent({ activeTab, setActiveTab }) {
                   </span>
                 )}
               </h2>
-              {renderTabContent()}
+
+              {activeTab === 'history' && (
+                /*
+                 * Pass setActiveTab so QuizHistory's "Start a Quiz" button can
+                 * navigate to the quiz tab (Issue 2 fix).
+                 */
+                <QuizHistory setActiveTab={setActiveTab} />
+              )}
+              {activeTab === 'analytics' && <AnalyticsDashboard />}
             </div>
           )}
         </motion.main>

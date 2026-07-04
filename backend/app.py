@@ -1,482 +1,592 @@
-import os
-import json
-import re
-import uuid
+"""
+app.py — QuizCraft AI Flask application (route layer only).
+
+Business logic lives in:
+  config.py                 — tuneable constants
+  utils/file_utils.py       — multi-format text extraction & sanitization
+  utils/logging_utils.py    — structured logging + in-memory analytics store
+  services/quiz_service.py  — OpenRouter / DeepSeek AI call
+"""
 import logging
+import os
 import traceback
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
-from pptx import Presentation
-import requests
 
-# Configure detailed logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+import config
+from utils.file_utils import (
+    extract_text,
+    get_extension,
+    get_file_type_label,
+    is_allowed_extension,
+    sanitize_content,
 )
-logger = logging.getLogger(__name__)
+from utils.logging_utils import (
+    estimate_cost,
+    generation_logs,
+    log_generation_failure,
+    log_generation_request,
+    log_generation_success,
+    log_upload,
+    log_upload_failure,
+)
+from services.quiz_service import generate_quiz
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("quizcraft")
+
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
 
-app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads")
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+app.config["UPLOAD_FOLDER"] = config.UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+os.makedirs(config.UPLOAD_FOLDER, exist_ok=True)
 
-# In-memory storage (replace with DB in production)
-quiz_sessions = {}
-quiz_history = []
+# ---------------------------------------------------------------------------
+# In-memory stores
+# ---------------------------------------------------------------------------
 
-
-def extract_text_from_pptx(filepath):
-    """Extract text content from PPTX file using python-pptx."""
-    logger.info(f"Extracting text from PPTX: {filepath}")
-    try:
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"File not found: {filepath}")
-        if os.path.getsize(filepath) == 0:
-            raise ValueError("Uploaded file is empty")
-
-        prs = Presentation(filepath)
-        slides_text = []
-        total_words = 0
-        
-        for i, slide in enumerate(prs.slides, 1):
-            slide_text = []
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_text.append(shape.text.strip())
-                if shape.has_table:
-                    table = shape.table
-                    for row in table.rows:
-                        for cell in row.cells:
-                            if cell.text.strip():
-                                slide_text.append(cell.text.strip())
-            
-            combined = "\n".join(slide_text)
-            words = len(combined.split())
-            total_words += words
-            slides_text.append({
-                "slide_number": i,
-                "text": combined,
-                "word_count": words
-            })
-        
-        logger.info(f"Extracted {total_words} words from {len(slides_text)} slides")
-        return {
-            "slide_count": len(slides_text),
-            "total_words": total_words,
-            "slides": slides_text
-        }
-    except Exception as e:
-        logger.error(f"Error extracting text from PPTX: {str(e)}")
-        raise Exception(f"Error extracting text from PPTX: {str(e)}")
+quiz_sessions: dict[str, dict] = {}   # session_id → session data
+quiz_history:  list[dict]      = []   # completed quiz results
 
 
-def generate_quiz_with_ai(content_text, question_count, difficulty):
-    """Generate quiz questions using OpenRouter DeepSeek API."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        logger.error("OPENROUTER_API_KEY not configured in .env")
-        raise Exception("OPENROUTER_API_KEY not configured. Please add your OpenRouter API key to the .env file.")
-    
-    logger.info(f"Generating {question_count} {difficulty} questions with AI")
-    
-    difficulty_prompts = {
-        "easy": "Generate EASY questions covering basic recall and simple understanding.",
-        "medium": "Generate MEDIUM questions requiring comprehension and application.",
-        "hard": "Generate HARD questions requiring analysis, evaluation, and synthesis."
-    }
-    
-    prompt = f"""You are a professional quiz generator. Based on the following presentation content, generate {question_count} multiple-choice questions at {difficulty.upper()} difficulty level.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-{difficulty_prompts.get(difficulty, difficulty_prompts["medium"])}
+def _err(message: str, status: int = 400):
+    return jsonify({"error": message}), status
 
-Presentation Content:
-{content_text}
 
-Return ONLY a valid JSON array (no markdown, no code fences). Each question object must have this exact structure:
-{{
-  "question": "The question text",
-  "options": ["Option A", "Option B", "Option C", "Option D"],
-  "correctAnswer": 0,
-  "explanation": "Brief explanation of why this answer is correct"
-}}
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-The correctAnswer field must be the 0-based index of the correct option (0, 1, 2, or 3).
-Generate exactly {question_count} questions. Make sure options are plausible and the correct answer is accurate based on the content provided."""
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("SITE_URL", "http://localhost:3000"),
-        "X-Title": "AI Quiz Generator"
-    }
-    
-    payload = {
-        "model": "deepseek/deepseek-chat-v3-0324:free",
-        "messages": [
-            {"role": "system", "content": "You are a professional quiz generator that outputs only valid JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 8192
-    }
-    
-    try:
-        logger.info("Sending request to OpenRouter API...")
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120
-        )
-        
-        logger.info(f"OpenRouter response status: {response.status_code}")
-        
-        if response.status_code == 401:
-            raise Exception("Invalid API key. Please check your OPENROUTER_API_KEY in .env")
-        if response.status_code == 429:
-            raise Exception("API rate limit exceeded. Please try again later.")
-        
-        response.raise_for_status()
-        data = response.json()
-        
-        if "choices" not in data or len(data["choices"]) == 0:
-            logger.error(f"Unexpected API response structure: {json.dumps(data, indent=2)[:500]}")
-            raise Exception("AI API returned an unexpected response format")
-        
-        content = data["choices"][0]["message"]["content"]
-        logger.debug(f"Raw AI response: {content[:200]}...")
-        
-        # Clean the response - remove markdown code fences if present
-        content = re.sub(r'```json\s*', '', content)
-        content = re.sub(r'```\s*', '', content)
-        content = content.strip()
-        
-        if not content:
-            raise Exception("AI returned empty content")
-        
-        # Try to extract JSON array if wrapped in extra text
-        json_match = re.search(r'\[.*\]', content, re.DOTALL)
-        if json_match:
-            content = json_match.group()
-        
-        questions = json.loads(content)
-        
-        if not isinstance(questions, list):
-            raise ValueError("AI response is not a JSON array")
-        
-        if len(questions) == 0:
-            raise ValueError("AI returned an empty question list")
-        
-        # Validate structure
-        for i, q in enumerate(questions):
-            if "question" not in q or "options" not in q or "correctAnswer" not in q or "explanation" not in q:
-                logger.warning(f"Question {i} missing fields: {json.dumps(q)[:200]}")
-                raise ValueError(f"Invalid question structure from AI at index {i}")
-            if len(q["options"]) != 4:
-                raise ValueError(f"Question {i} must have exactly 4 options (got {len(q['options'])})")
-            if not isinstance(q["correctAnswer"], int) or q["correctAnswer"] < 0 or q["correctAnswer"] > 3:
-                raise ValueError(f"Question {i} correctAnswer must be 0-3")
-        
-        logger.info(f"Successfully generated {len(questions)} questions")
-        return questions
-    
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse AI response as JSON: {content[:500]}")
-        raise Exception(f"Failed to parse AI response as JSON. Raw response: {content[:200]}...")
-    except requests.exceptions.Timeout:
-        logger.error("AI API request timed out after 120 seconds")
-        raise Exception("AI API request timed out. Please try again.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"API request failed: {str(e)}")
-        raise Exception(f"API request failed: {str(e)}")
-    except Exception as e:
-        logger.error(f"Quiz generation failed: {str(e)}\n{traceback.format_exc()}")
-        raise Exception(f"Quiz generation failed: {str(e)}")
-
+# ---------------------------------------------------------------------------
+# Routes — Health
+# ---------------------------------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
-    logger.info("Health check requested")
     return jsonify({
         "status": "ok",
-        "message": "Quiz Generator API is running",
-        "timestamp": str(datetime.now())
+        "message": "QuizCraft AI API is running",
+        "timestamp": _now_iso(),
+        "api_key_configured": bool(os.getenv("OPENROUTER_API_KEY")),
+        "supported_formats": sorted(config.ALLOWED_EXTENSIONS),
     })
 
 
+# ---------------------------------------------------------------------------
+# Routes — Upload (multi-format)
+# ---------------------------------------------------------------------------
+
 @app.route("/api/upload", methods=["POST"])
-def upload_pptx():
-    """Upload and process a PPT/PPTX file."""
-    logger.info("Upload endpoint called")
-    
-    # Check if file was provided
+def upload_file():
+    """
+    Accept PPT, PPTX, PDF, DOCX, or TXT. Extract text, create a session.
+    Returns session_id, filename, file_type, slide_count, total_words, slides[].
+    """
+    logger.info("POST /api/upload")
+
     if "file" not in request.files:
-        logger.error("No file part in request")
-        return jsonify({"error": "No file provided. Please select a file to upload."}), 400
-    
+        log_upload_failure(filename="(none)", reason="missing file field")
+        return _err("No file received. The form field must be named 'file'.")
+
     file = request.files["file"]
-    
-    if file.filename == "":
-        logger.error("Empty filename")
-        return jsonify({"error": "No file selected. Please choose a file."}), 400
-    
-    logger.info(f"Received file: {file.filename}")
-    
-    if not file.filename.lower().endswith((".ppt", ".pptx")):
-        logger.error(f"Invalid file format: {file.filename}")
-        return jsonify({"error": "Invalid file format. Only PPT and PPTX files are allowed."}), 400
-    
-    # Generate unique filename
-    ext = os.path.splitext(file.filename)[1]
-    unique_filename = f"{uuid.uuid4()}{ext}"
-    filepath = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
-    
+    if not file or file.filename == "":
+        log_upload_failure(filename="(empty)", reason="empty filename")
+        return _err("No file selected.")
+
+    filename = file.filename
+    logger.info("Received: %r (%s)", filename, file.content_type)
+
+    if not is_allowed_extension(filename):
+        ext = get_extension(filename) or "(no extension)"
+        log_upload_failure(filename=filename, reason=f"unsupported extension {ext!r}")
+        return _err(
+            f"Unsupported file type '{ext}'. "
+            f"Accepted: {', '.join(sorted(config.ALLOWED_EXTENSIONS))}"
+        )
+
+    ext       = get_extension(filename)
+    file_type = get_file_type_label(filename)
+    saved_name = f"{uuid.uuid4()}{ext}"
+    filepath   = os.path.join(config.UPLOAD_FOLDER, saved_name)
+
     try:
         file.save(filepath)
-        logger.info(f"File saved to: {filepath}")
-        
-        extracted = extract_text_from_pptx(filepath)
-        
+        file_size = os.path.getsize(filepath)
+
+        if file_size == 0:
+            os.remove(filepath)
+            return _err("Uploaded file is empty.")
+
+        # extract_text handles all supported formats and returns
+        # {slide_count, total_words, slides[], file_processing_time_seconds}
+        extracted = extract_text(filepath, filename)
+
+        raw_text   = "\n\n".join(s["text"] for s in extracted["slides"] if s["text"].strip())
+        clean_text = sanitize_content(raw_text)
+
+        if not clean_text:
+            os.remove(filepath)
+            return _err(
+                "No readable text found. "
+                "The file may contain only images or be password-protected."
+            )
+
         session_id = str(uuid.uuid4())
-        full_text = "\n".join([s["text"] for s in extracted["slides"]])
-        
-        if not full_text.strip():
-            logger.warning("No text content extracted from presentation")
-            # Clean up empty file
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            return jsonify({
-                "error": "No text content found in the presentation. The PPTX file may contain only images."
-            }), 400
-        
+        proc_time  = extracted.get("file_processing_time_seconds", 0.0)
+
         quiz_sessions[session_id] = {
-            "filepath": filepath,
-            "filename": file.filename,
+            "filepath":          filepath,
+            "filename":          filename,
+            "file_type":         file_type,
+            "file_size_bytes":   file_size,
             "extracted_content": extracted,
-            "full_text": full_text
+            "clean_text":        clean_text,
+            "file_processing_time": proc_time,
         }
-        
-        logger.info(f"Upload successful. Session ID: {session_id}, Slides: {extracted['slide_count']}")
-        
+
+        log_upload(
+            filename=filename,
+            file_size_bytes=file_size,
+            slide_count=extracted["slide_count"],
+            total_words=extracted["total_words"],
+            session_id=session_id,
+            file_processing_time=proc_time,
+        )
+
         return jsonify({
-            "session_id": session_id,
-            "filename": file.filename,
+            "session_id":  session_id,
+            "filename":    filename,
+            "file_type":   file_type,
             "slide_count": extracted["slide_count"],
             "total_words": extracted["total_words"],
-            "slides": extracted["slides"]
+            "slides":      extracted["slides"],
+            "file_processing_time_seconds": proc_time,
         }), 200
-    
-    except Exception as e:
-        logger.error(f"Upload failed: {str(e)}\n{traceback.format_exc()}")
-        # Clean up on error
+
+    except ValueError as exc:
+        logger.warning("Upload rejected: %s", exc)
         if os.path.exists(filepath):
             os.remove(filepath)
-        return jsonify({"error": str(e)}), 500
+        log_upload_failure(filename=filename, reason=str(exc))
+        return _err(str(exc))
 
+    except Exception as exc:
+        logger.error("Unexpected upload error:\n%s", traceback.format_exc())
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        log_upload_failure(filename=filename, reason=str(exc))
+        return _err(f"Upload failed: {exc}", 500)
+
+
+# ---------------------------------------------------------------------------
+# Routes — Generate Quiz
+# ---------------------------------------------------------------------------
 
 @app.route("/api/generate-quiz", methods=["POST"])
-def generate_quiz():
-    """Generate quiz questions from uploaded content."""
-    logger.info("Generate quiz endpoint called")
-    
-    if not request.is_json:
-        logger.error("Request Content-Type is not JSON")
-        return jsonify({"error": "Request must be JSON. Set Content-Type: application/json."}), 400
-    
-    data = request.get_json()
-    if not data:
-        logger.error("Empty JSON body")
-        return jsonify({"error": "Empty request body. Provide session_id, question_count, and difficulty."}), 400
-    
-    session_id = data.get("session_id")
-    question_count = int(data.get("question_count", 10))
-    difficulty = data.get("difficulty", "medium")
-    
-    logger.info(f"Session ID: {session_id}, Questions: {question_count}, Difficulty: {difficulty}")
-    
-    if not session_id:
-        return jsonify({"error": "Missing session_id. Please upload a file first."}), 400
-    
-    if session_id not in quiz_sessions:
-        logger.error(f"Invalid session ID: {session_id}")
-        return jsonify({"error": "Invalid or expired session. Please upload a file first."}), 400
-    
-    if question_count < 5 or question_count > 30:
-        return jsonify({"error": "Question count must be between 5 and 30."}), 400
-    
-    if difficulty not in ["easy", "medium", "hard"]:
-        return jsonify({"error": "Difficulty must be easy, medium, or hard."}), 400
-    
-    session = quiz_sessions[session_id]
-    full_text = session["full_text"]
-    
-    if not full_text.strip():
-        return jsonify({"error": "No text content found in the presentation."}), 400
-    
-    try:
-        questions = generate_quiz_with_ai(full_text, question_count, difficulty)
-        
-        # Store quiz in session
-        session["questions"] = questions
-        session["difficulty"] = difficulty
-        session["question_count"] = question_count
-        
-        logger.info(f"Quiz generated successfully: {len(questions)} questions")
-        
-        return jsonify({
-            "session_id": session_id,
-            "questions": questions,
-            "total_questions": len(questions),
-            "difficulty": difficulty
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"Quiz generation failed: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+def generate_quiz_route():
+    """
+    Generate quiz questions and return them with token/cost metadata.
+    """
+    logger.info("POST /api/generate-quiz")
 
+    if not request.is_json:
+        return _err("Content-Type must be application/json.")
+
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    difficulty  = data.get("difficulty", "medium")
+
+    try:
+        question_count = int(data.get("question_count", config.DEFAULT_QUESTIONS))
+    except (TypeError, ValueError):
+        return _err("question_count must be an integer.")
+
+    if not session_id:
+        return _err("Missing session_id. Upload a file first.")
+    if session_id not in quiz_sessions:
+        return _err("Session not found or expired. Re-upload your file.")
+    if not (config.MIN_QUESTIONS <= question_count <= config.MAX_QUESTIONS):
+        return _err(f"question_count must be {config.MIN_QUESTIONS}–{config.MAX_QUESTIONS}.")
+    if difficulty not in config.VALID_DIFFICULTIES:
+        return _err(f"difficulty must be one of {sorted(config.VALID_DIFFICULTIES)}.")
+
+    session    = quiz_sessions[session_id]
+    clean_text = session.get("clean_text", "")
+
+    if not clean_text:
+        return _err("No text content in session. Re-upload your file.")
+
+    start_time = log_generation_request(
+        session_id=session_id,
+        question_count=question_count,
+        difficulty=difficulty,
+        content_length=len(clean_text),
+    )
+
+    try:
+        questions, usage = generate_quiz(clean_text, question_count, difficulty)
+
+        gen_record = log_generation_success(
+            session_id=session_id,
+            start_time=start_time,
+            model=usage["model"],
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            questions_returned=len(questions),
+            filename=session.get("filename", ""),
+            file_type=session.get("file_type", ""),
+            total_words=session.get("extracted_content", {}).get("total_words", 0),
+            question_count=question_count,
+            difficulty=difficulty,
+            file_processing_time=session.get("file_processing_time", 0.0),
+        )
+
+        session.update({"questions": questions, "difficulty": difficulty,
+                        "question_count": question_count, "gen_record": gen_record})
+
+        return jsonify({
+            "session_id":      session_id,
+            "questions":       questions,
+            "total_questions": len(questions),
+            "difficulty":      difficulty,
+            # token & cost info for the UI
+            "usage": {
+                "model":               usage["model"],
+                "input_tokens":        usage["input_tokens"],
+                "output_tokens":       usage["output_tokens"],
+                "total_tokens":        usage["input_tokens"] + usage["output_tokens"],
+                "latency_seconds":     gen_record["latency_seconds"],
+                "estimated_cost_usd":  gen_record["estimated_cost_usd"],
+            },
+        }), 200
+
+    except Exception as exc:
+        log_generation_failure(
+            session_id=session_id,
+            start_time=start_time,
+            error=str(exc),
+            difficulty=difficulty,
+            question_count=question_count,
+            filename=session.get("filename", ""),
+        )
+        logger.error("Generation failed:\n%s", traceback.format_exc())
+        return _err(str(exc), 500)
+
+
+# ---------------------------------------------------------------------------
+# Routes — Submit Quiz
+# ---------------------------------------------------------------------------
 
 @app.route("/api/submit-quiz", methods=["POST"])
 def submit_quiz():
-    """Submit quiz answers and get results."""
-    logger.info("Submit quiz endpoint called")
-    
+    logger.info("POST /api/submit-quiz")
+
     if not request.is_json:
-        logger.error("Request Content-Type is not JSON")
-        return jsonify({"error": "Request must be JSON."}), 400
-    
-    data = request.get_json()
-    session_id = data.get("session_id") if data else None
-    answers = data.get("answers", {}) if data else {}
-    
+        return _err("Content-Type must be application/json.")
+
+    data       = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    answers    = data.get("answers", {})
+
     if not session_id:
-        return jsonify({"error": "Missing session_id."}), 400
-    
+        return _err("Missing session_id.")
     if session_id not in quiz_sessions:
-        logger.error(f"Invalid session ID for submit: {session_id}")
-        return jsonify({"error": "Invalid or expired session."}), 400
-    
-    session = quiz_sessions[session_id]
-    questions = session.get("questions", [])
-    
+        return _err("Session not found or expired.")
+
+    session   = quiz_sessions[session_id]
+    questions = session.get("questions")
+
     if not questions:
-        return jsonify({"error": "No quiz found. Please generate a quiz first."}), 400
-    
+        return _err("No quiz found. Generate a quiz first.")
+
     results = []
     correct_count = 0
-    
+
     for i, q in enumerate(questions):
         user_answer = answers.get(str(i))
-        is_correct = user_answer == q["correctAnswer"]
+        is_correct  = user_answer == q["correctAnswer"]
         if is_correct:
             correct_count += 1
-        
+
         results.append({
-            "question_number": i + 1,
-            "question": q["question"],
-            "options": q["options"],
-            "correct_answer": q["correctAnswer"],
-            "correct_text": q["options"][q["correctAnswer"]],
-            "user_answer": user_answer,
-            "user_answer_text": q["options"][user_answer] if user_answer is not None else None,
-            "is_correct": is_correct,
-            "explanation": q["explanation"]
+            "question_number":  i + 1,
+            "question":         q["question"],
+            "options":          q["options"],
+            "correct_answer":   q["correctAnswer"],
+            "correct_text":     q["options"][q["correctAnswer"]],
+            "user_answer":      user_answer,
+            "user_answer_text": q["options"][user_answer] if isinstance(user_answer, int) else None,
+            "is_correct":       is_correct,
+            "explanation":      q["explanation"],
+            "bloomLevel":       q.get("bloomLevel", ""),
         })
-    
-    total_questions = len(questions)
-    score = correct_count
-    percentage = round((correct_count / total_questions) * 100, 2)
-    
-    result = {
-        "session_id": session_id,
-        "score": score,
-        "total_questions": total_questions,
-        "percentage": percentage,
-        "passed": percentage >= 60,
-        "correct_count": correct_count,
-        "wrong_count": total_questions - correct_count,
-        "results": results,
-        "difficulty": session.get("difficulty", "medium"),
-        "filename": session.get("filename", "Unknown")
-    }
-    
-    # Save to history
+
+    total      = len(questions)
+    percentage = round((correct_count / total) * 100, 2)
+    passed     = percentage >= config.PASS_THRESHOLD_PERCENT
+    gen_record = session.get("gen_record", {})
+
     history_entry = {
-        "id": str(uuid.uuid4()),
-        "filename": session.get("filename", "Unknown"),
-        "difficulty": session.get("difficulty", "medium"),
-        "score": score,
-        "total_questions": total_questions,
-        "percentage": percentage,
-        "passed": percentage >= 60,
-        "timestamp": str(datetime.now())
+        "id":              str(uuid.uuid4()),
+        "filename":        session.get("filename", "Unknown"),
+        "file_type":       session.get("file_type", ""),
+        "difficulty":      session.get("difficulty", "medium"),
+        "score":           correct_count,
+        "total_questions": total,
+        "percentage":      percentage,
+        "passed":          passed,
+        "timestamp":       _now_iso(),
+        # analytics stored with every history entry
+        "total_words":     session.get("extracted_content", {}).get("total_words", 0),
+        "latency_seconds": gen_record.get("latency_seconds", 0),
+        "input_tokens":    gen_record.get("input_tokens", 0),
+        "output_tokens":   gen_record.get("output_tokens", 0),
+        "total_tokens":    gen_record.get("total_tokens", 0),
+        "estimated_cost_usd": gen_record.get("estimated_cost_usd", 0),
+        "model":           gen_record.get("model", config.OPENROUTER_MODEL),
+        "file_processing_time_seconds": session.get("file_processing_time", 0),
     }
     quiz_history.append(history_entry)
-    
-    logger.info(f"Quiz submitted: Score {score}/{total_questions} ({percentage}%)")
-    
-    return jsonify(result), 200
 
+    logger.info(
+        "Quiz submitted — session=%s  score=%d/%d (%.1f%%)",
+        session_id, correct_count, total, percentage,
+    )
 
-@app.route("/api/history", methods=["GET"])
-def get_history():
-    """Get quiz history."""
-    logger.info(f"History endpoint called. Total entries: {len(quiz_history)}")
-    return jsonify({"history": quiz_history[-50:]}), 200
-
-
-@app.route("/api/session/<session_id>", methods=["GET"])
-def get_session(session_id):
-    """Get session info."""
-    logger.info(f"Session info requested for: {session_id}")
-    if session_id not in quiz_sessions:
-        return jsonify({"error": "Session not found"}), 404
-    
-    session = quiz_sessions[session_id]
     return jsonify({
-        "filename": session.get("filename"),
-        "slide_count": session.get("extracted_content", {}).get("slide_count"),
-        "total_words": session.get("extracted_content", {}).get("total_words"),
-        "has_questions": "questions" in session
+        "session_id":    session_id,
+        "score":         correct_count,
+        "total_questions": total,
+        "percentage":    percentage,
+        "passed":        passed,
+        "correct_count": correct_count,
+        "wrong_count":   total - correct_count,
+        "results":       results,
+        "difficulty":    session.get("difficulty", "medium"),
+        "filename":      session.get("filename", "Unknown"),
+        "usage":         {
+            "model":              gen_record.get("model", config.OPENROUTER_MODEL),
+            "total_tokens":       gen_record.get("total_tokens", 0),
+            "latency_seconds":    gen_record.get("latency_seconds", 0),
+            "estimated_cost_usd": gen_record.get("estimated_cost_usd", 0),
+        },
     }), 200
 
 
-# Global error handler for 404s
+# ---------------------------------------------------------------------------
+# Routes — History (enhanced)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    """
+    Return history with optional search / filter / sort.
+
+    Query params:
+      q         — search string (matches filename, difficulty)
+      difficulty — easy | medium | hard
+      sort      — newest (default) | oldest
+      limit     — integer (default 50)
+    """
+    q          = (request.args.get("q") or "").lower().strip()
+    difficulty = (request.args.get("difficulty") or "").lower().strip()
+    sort       = request.args.get("sort", "newest")
+    try:
+        limit = min(int(request.args.get("limit", 50)), config.HISTORY_MAX_ENTRIES)
+    except ValueError:
+        limit = 50
+
+    entries = list(quiz_history)
+
+    if q:
+        entries = [e for e in entries
+                   if q in e.get("filename", "").lower()
+                   or q in e.get("difficulty", "").lower()]
+
+    if difficulty in ("easy", "medium", "hard"):
+        entries = [e for e in entries if e.get("difficulty") == difficulty]
+
+    if sort == "oldest":
+        entries = entries[:limit]
+    else:
+        entries = list(reversed(entries))[:limit]
+
+    logger.info("GET /api/history — %d entries returned", len(entries))
+    return jsonify({"history": entries, "total": len(quiz_history)}), 200
+
+
+@app.route("/api/history/<entry_id>", methods=["DELETE"])
+def delete_history_entry(entry_id: str):
+    """Delete a single history entry by its id."""
+    global quiz_history
+    before = len(quiz_history)
+    quiz_history = [e for e in quiz_history if e.get("id") != entry_id]
+    if len(quiz_history) == before:
+        return _err("History entry not found.", 404)
+    logger.info("Deleted history entry %s", entry_id)
+    return jsonify({"message": "Deleted successfully."}), 200
+
+
+@app.route("/api/history", methods=["DELETE"])
+def clear_history():
+    """Delete all history entries."""
+    global quiz_history
+    count = len(quiz_history)
+    quiz_history = []
+    logger.info("Cleared %d history entries.", count)
+    return jsonify({"message": f"Cleared {count} entries."}), 200
+
+
+# ---------------------------------------------------------------------------
+# Routes — Evaluation Dashboard
+# ---------------------------------------------------------------------------
+
+@app.route("/api/evaluation", methods=["GET"])
+def get_evaluation():
+    """
+    Return aggregated metrics for the Evaluation Dashboard.
+
+    Derived from generation_logs (every attempt, success + failure).
+    """
+    logs = generation_logs
+
+    total_attempts  = len(logs)
+    successful      = [l for l in logs if l.get("success")]
+    failed          = [l for l in logs if not l.get("success")]
+    success_count   = len(successful)
+    failure_count   = len(failed)
+    success_rate    = round(success_count / total_attempts * 100, 1) if total_attempts else 0
+    failure_rate    = round(failure_count / total_attempts * 100, 1) if total_attempts else 0
+
+    avg_latency     = round(sum(l["latency_seconds"] for l in successful) / success_count, 2) \
+                      if success_count else 0
+    avg_tokens      = round(sum(l.get("total_tokens", 0) for l in successful) / success_count) \
+                      if success_count else 0
+    total_cost      = round(sum(l.get("estimated_cost_usd", 0) for l in successful), 6)
+    avg_file_proc   = round(
+        sum(l.get("file_processing_time_seconds", 0) for l in successful) / success_count, 3
+    ) if success_count else 0
+
+    # per-difficulty breakdown
+    diff_stats: dict[str, dict] = {}
+    for diff in ("easy", "medium", "hard"):
+        subset = [l for l in successful if l.get("difficulty") == diff]
+        diff_stats[diff] = {
+            "count":       len(subset),
+            "avg_latency": round(sum(l["latency_seconds"] for l in subset) / len(subset), 2)
+                           if subset else 0,
+            "avg_tokens":  round(sum(l.get("total_tokens", 0) for l in subset) / len(subset))
+                           if subset else 0,
+        }
+
+    # per-file-type breakdown
+    type_counts: dict[str, int] = {}
+    for l in successful:
+        ft = l.get("file_type") or "Unknown"
+        type_counts[ft] = type_counts.get(ft, 0) + 1
+
+    # recent 20 successful logs for the timeline chart
+    recent = [
+        {
+            "timestamp":    l["timestamp"],
+            "latency":      l["latency_seconds"],
+            "total_tokens": l.get("total_tokens", 0),
+            "difficulty":   l.get("difficulty", ""),
+            "filename":     l.get("filename", ""),
+            "success":      l["success"],
+        }
+        for l in logs[-20:]
+    ]
+
+    return jsonify({
+        "total_attempts":       total_attempts,
+        "success_count":        success_count,
+        "failure_count":        failure_count,
+        "success_rate_percent": success_rate,
+        "failure_rate_percent": failure_rate,
+        "avg_latency_seconds":  avg_latency,
+        "avg_tokens":           avg_tokens,
+        "total_cost_usd":       total_cost,
+        "avg_file_processing_seconds": avg_file_proc,
+        "model":                config.OPENROUTER_MODEL,
+        "difficulty_breakdown": diff_stats,
+        "file_type_breakdown":  type_counts,
+        "recent_logs":          recent,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# Routes — Session
+# ---------------------------------------------------------------------------
+
+@app.route("/api/session/<session_id>", methods=["GET"])
+def get_session(session_id: str):
+    if session_id not in quiz_sessions:
+        return _err("Session not found.", 404)
+    s = quiz_sessions[session_id]
+    return jsonify({
+        "filename":    s.get("filename"),
+        "file_type":   s.get("file_type"),
+        "slide_count": s.get("extracted_content", {}).get("slide_count"),
+        "total_words": s.get("extracted_content", {}).get("total_words"),
+        "has_questions": "questions" in s,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# Global error handlers
+# ---------------------------------------------------------------------------
+
 @app.errorhandler(404)
-def not_found(e):
-    logger.warning(f"404 error: {str(e)}")
-    return jsonify({"error": "Endpoint not found. Available endpoints: /api/health, /api/upload, /api/generate-quiz, /api/submit-quiz, /api/history, /api/session/<id>"}), 404
+def not_found(_e):
+    return _err(
+        "Endpoint not found. See /api/health for available routes.", 404
+    )
 
 
-# Global error handler for 413 (file too large)
 @app.errorhandler(413)
-def too_large(e):
-    logger.warning("File too large error")
-    return jsonify({"error": "File too large. Maximum size is 50MB."}), 413
+def too_large(_e):
+    return _err("File too large. Maximum is 50 MB.", 413)
 
 
-# Global error handler for 500
 @app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"Internal server error: {str(e)}")
-    return jsonify({"error": "Internal server error. Please try again."}), 500
+def internal_error(_e):
+    logger.error("Unhandled 500:\n%s", traceback.format_exc())
+    return _err("Internal server error. Please try again.", 500)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    
-    api_key_status = "CONFIGURED" if os.getenv("OPENROUTER_API_KEY") else "NOT SET"
-    logger.info(f"Starting Quiz Generator API on port {port} (debug={debug})")
-    logger.info(f"OpenRouter API Key: {api_key_status}")
-    logger.info(f"Upload folder: {app.config['UPLOAD_FOLDER']}")
-    
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    key_ok = "✓ configured" if os.getenv("OPENROUTER_API_KEY") else "✗ NOT SET"
+    logger.info("=" * 60)
+    logger.info("  QuizCraft AI Backend")
+    logger.info("  Port            : %d", config.PORT)
+    logger.info("  Debug mode      : %s", config.FLASK_DEBUG)
+    logger.info("  Upload folder   : %s", config.UPLOAD_FOLDER)
+    logger.info("  Max upload size : %d MB", config.MAX_CONTENT_LENGTH // (1024 * 1024))
+    logger.info("  OpenRouter key  : %s", key_ok)
+    logger.info("  Supported types : %s", ", ".join(sorted(config.ALLOWED_EXTENSIONS)))
+    logger.info("=" * 60)
+    app.run(host="0.0.0.0", port=config.PORT, debug=config.FLASK_DEBUG)

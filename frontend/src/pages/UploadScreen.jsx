@@ -13,13 +13,9 @@ export default function UploadScreen() {
   const dropRef = useRef(null);
 
   const validateFile = (file) => {
-    const allowedTypes = [
-      'application/vnd.ms-powerpoint',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    ];
     const ext = file.name.toLowerCase().split('.').pop();
-    if (!['ppt', 'pptx'].includes(ext)) {
-      setLocalError('Invalid format. Please upload a .ppt or .pptx file.');
+    if (!['ppt', 'pptx', 'pdf', 'docx', 'txt'].includes(ext)) {
+      setLocalError('Invalid format. Please upload a .ppt, .pptx, .pdf, .docx, or .txt file.');
       return false;
     }
     if (file.size > 50 * 1024 * 1024) {
@@ -133,7 +129,7 @@ export default function UploadScreen() {
           <input
             ref={inputRef}
             type="file"
-            accept=".ppt,.pptx"
+            accept=".ppt,.pptx,.pdf,.docx,.txt"
             onChange={handleChange}
             className="hidden"
           />
@@ -161,7 +157,7 @@ export default function UploadScreen() {
                 </p>
                 <div className="flex items-center justify-center gap-2 text-sm text-gray-500">
                   <FileText className="w-4 h-4" />
-                  <span>Supports .ppt and .pptx (max 50MB)</span>
+                  <span>Supports .ppt, .pptx, .pdf, .docx, .txt (max 50MB)</span>
                 </div>
               </motion.div>
             ) : (
