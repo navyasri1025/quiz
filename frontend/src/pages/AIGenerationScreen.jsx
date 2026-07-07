@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Brain, Loader } from 'lucide-react';
+import { Brain, Loader, AlertCircle, ArrowLeft } from 'lucide-react';
 import { useQuiz } from '../context/QuizContext';
 
 // lucide-react v1 does not export Sparkles — use an inline SVG instead.
@@ -35,7 +35,35 @@ const PROGRESS_STEPS = [
 ];
 
 export default function AIGenerationScreen() {
-  const { generationProgress, generationStatus } = useQuiz();
+  const { generationProgress, generationStatus, generationError, dispatch } = useQuiz();
+
+  // ── Error state — show a clear message and a back button ──────────────
+  if (generationError) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="max-w-md w-full text-center"
+        >
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-red-500/15 border border-red-500/20 mb-6">
+            <AlertCircle className="w-8 h-8 text-red-400" />
+          </div>
+          <h2 className="text-xl font-bold text-white mb-3">Generation Failed</h2>
+          <p className="text-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded-xl p-4 mb-6 text-left break-words">
+            {generationError}
+          </p>
+          <button
+            onClick={() => dispatch({ type: 'SET_SCREEN', payload: 'configure' })}
+            className="btn-primary flex items-center gap-2 mx-auto"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Back to Configure
+          </button>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4 relative overflow-hidden">

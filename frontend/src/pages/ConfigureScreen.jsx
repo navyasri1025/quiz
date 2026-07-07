@@ -15,13 +15,14 @@ export default function ConfigureScreen() {
 
   const handleGenerate = async () => {
     if (!sessionId) {
-      setLocalError('Session expired. Please upload again.');
+      setLocalError('No active session. Please go back and upload your file again.');
       return;
     }
     try {
       setLocalError(null);
       await generateQuiz(sessionId, questionCount, difficulty);
     } catch (err) {
+      // Surface the backend error message directly (includes "Session not found or expired")
       setLocalError(err.message);
     }
   };
@@ -203,6 +204,20 @@ export default function ConfigureScreen() {
           </div>
         </motion.div>
 
+        {/* No-session warning */}
+        {!sessionId && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="mt-4 p-4 rounded-xl bg-yellow-500/10 border border-yellow-500/20 flex items-start gap-3"
+          >
+            <AlertCircle className="w-5 h-5 text-yellow-400 mt-0.5 shrink-0" />
+            <p className="text-sm text-yellow-300">
+              No active session found. Please go back and upload your file again.
+            </p>
+          </motion.div>
+        )}
+
         {/* Error */}
         {localError && (
           <motion.div
@@ -224,8 +239,9 @@ export default function ConfigureScreen() {
         >
           <button
             onClick={handleGenerate}
-            disabled={generating}
-            className="btn-primary text-lg px-12 py-4"
+            disabled={generating || !sessionId}
+            title={!sessionId ? 'Upload a file first to enable quiz generation' : undefined}
+            className={`btn-primary text-lg px-12 py-4 ${!sessionId ? 'opacity-40 cursor-not-allowed' : ''}`}
           >
             {generating ? (
               <span className="flex items-center gap-3">

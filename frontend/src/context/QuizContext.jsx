@@ -6,6 +6,12 @@
  *   - Upload, generation, quiz, and results state
  *   - Quiz history list
  *
+ * sessionStorage persistence:
+ *   - On UPLOAD_SUCCESS: saves sessionId + file metadata to sessionStorage.
+ *   - On init: restores sessionId + file metadata from sessionStorage so a
+ *     page refresh doesn't lose the session while the backend is still running.
+ *   - On RESET: clears sessionStorage so stale session data is never reused.
+ *
  * All network calls are delegated to api.js so this file contains no fetch()
  * calls and no URL strings — pure state + orchestration logic.
  */
@@ -14,43 +20,99 @@ import * as api from '../api';
 
 const QuizContext = createContext(null);
 
-const initialState = {
-  // Current screen in the quiz flow
-  screen: 'upload', // 'upload' | 'configure' | 'generating' | 'quiz' | 'results'
+// ---------------------------------------------------------------------------
+// sessionStorage helpers
+// ---------------------------------------------------------------------------
 
-  // ── Upload ───────────────────────────────────────────────────────────────
-  sessionId: null,
-  filename: null,
-  slideCount: 0,
-  totalWords: 0,
-  slides: [],
-  uploading: false,
-  uploadError: null,
+const SS_KEY = 'quizcraft_session';
 
-  // ── Configure ────────────────────────────────────────────────────────────
-  questionCount: 10,
-  difficulty: 'medium',
+function saveSession(payload) {
+  try {
+    sessionStorage.setItem(SS_KEY, JSON.stringify({
+      sessionId:  payload.session_id,
+      filename:   payload.filename,
+      slideCount: payload.slide_count,
+      totalWords: payload.total_words,
+      slides:     payload.slides,
+    }));
+    console.debug('[QuizContext] Session saved to sessionStorage:', payload.session_id);
+  } catch (e) {
+    console.warn('[QuizContext] Could not write to sessionStorage:', e);
+  }
+}
 
-  // ── Generating ───────────────────────────────────────────────────────────
-  generating: false,
-  generationProgress: 0,
-  generationStatus: '',
-  generationError: null,
+function loadSession() {
+  try {
+    const raw = sessionStorage.getItem(SS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    console.debug('[QuizContext] Restored session from sessionStorage:', parsed.sessionId);
+    return parsed;
+  } catch (e) {
+    console.warn('[QuizContext] Could not read from sessionStorage:', e);
+    return null;
+  }
+}
 
-  // ── Quiz ─────────────────────────────────────────────────────────────────
-  questions: [],
-  currentQuestion: 0,
-  answers: {},
-  quizStarted: false,
-  quizSubmitted: false,
+function clearSession() {
+  try {
+    sessionStorage.removeItem(SS_KEY);
+    console.debug('[QuizContext] Session cleared from sessionStorage.');
+  } catch (e) {
+    console.warn('[QuizContext] Could not clear sessionStorage:', e);
+  }
+}
 
-  // ── Results ──────────────────────────────────────────────────────────────
-  results: null,
+// ---------------------------------------------------------------------------
+// Initial state — hydrate from sessionStorage when available
+// ---------------------------------------------------------------------------
 
-  // ── History ──────────────────────────────────────────────────────────────
-  history: [],
-  historyLoading: false,
-};
+function buildInitialState() {
+  const saved = loadSession();
+  return {
+    // Current screen in the quiz flow
+    screen: saved ? 'configure' : 'upload', // restore to configure if session exists
+
+    // ── Upload ───────────────────────────────────────────────────────────────
+    sessionId:   saved?.sessionId   ?? null,
+    filename:    saved?.filename    ?? null,
+    slideCount:  saved?.slideCount  ?? 0,
+    totalWords:  saved?.totalWords  ?? 0,
+    slides:      saved?.slides      ?? [],
+    uploading:   false,
+    uploadError: null,
+
+    // ── Configure ────────────────────────────────────────────────────────────
+    questionCount: 10,
+    difficulty: 'medium',
+
+    // ── Generating ───────────────────────────────────────────────────────────
+    generating:          false,
+    generationProgress:  0,
+    generationStatus:    '',
+    generationError:     null,
+
+    // ── Quiz ─────────────────────────────────────────────────────────────────
+    questions:       [],
+    currentQuestion: 0,
+    answers:         {},
+    quizStarted:     false,
+    quizSubmitted:   false,
+
+    // ── Results ──────────────────────────────────────────────────────────────
+    results: null,
+
+    // ── History ──────────────────────────────────────────────────────────────
+    history:        [],
+    historyLoading: false,
+  };
+}
+
+const initialState = buildInitialState();
+
+// ---------------------------------------------------------------------------
+// Reducer
+// ---------------------------------------------------------------------------
 
 function quizReducer(state, action) {
   switch (action.type) {
@@ -63,13 +125,13 @@ function quizReducer(state, action) {
     case 'UPLOAD_SUCCESS':
       return {
         ...state,
-        uploading: false,
-        sessionId: action.payload.session_id,
-        filename: action.payload.filename,
+        uploading:  false,
+        sessionId:  action.payload.session_id,
+        filename:   action.payload.filename,
         slideCount: action.payload.slide_count,
         totalWords: action.payload.total_words,
-        slides: action.payload.slides,
-        screen: 'configure',
+        slides:     action.payload.slides,
+        screen:     'configure',
       };
     case 'UPLOAD_ERROR':
       return { ...state, uploading: false, uploadError: action.payload };
@@ -84,35 +146,37 @@ function quizReducer(state, action) {
     case 'GENERATE_START':
       return {
         ...state,
-        screen: 'generating',
-        generating: true,
+        screen:             'generating',
+        generating:         true,
         generationProgress: 0,
-        generationStatus: 'Initializing AI engine…',
-        generationError: null,
+        generationStatus:   'Initializing AI engine…',
+        generationError:    null,
       };
     case 'GENERATE_PROGRESS':
       return {
         ...state,
         generationProgress: action.payload.progress,
-        generationStatus: action.payload.status,
+        generationStatus:   action.payload.status,
       };
     case 'GENERATE_SUCCESS':
       return {
         ...state,
-        generating: false,
+        generating:         false,
         generationProgress: 100,
-        generationStatus: 'Quiz generated successfully!',
-        questions: action.payload.questions,
-        screen: 'quiz',
-        quizStarted: true,
-        currentQuestion: 0,
-        answers: {},
+        generationStatus:   'Quiz generated successfully!',
+        questions:          action.payload.questions,
+        screen:             'quiz',
+        quizStarted:        true,
+        currentQuestion:    0,
+        answers:            {},
       };
     case 'GENERATE_ERROR':
       return {
         ...state,
-        screen: 'configure',
-        generating: false,
+        // Stay on the generating screen so the error banner is visible there.
+        // The user can click "Try Again" to go back to configure manually.
+        screen:          'generating',
+        generating:      false,
         generationError: action.payload,
       };
 
@@ -135,8 +199,10 @@ function quizReducer(state, action) {
       return { ...state, results: action.payload, screen: 'results' };
 
     // Reset — keeps history so the Analytics tab stays populated.
+    // Also clears sessionStorage (side-effect handled in the action dispatcher).
     case 'RESET':
-      return { ...initialState, history: state.history };
+      return { ...buildInitialState(), history: state.history, screen: 'upload', sessionId: null,
+               filename: null, slideCount: 0, totalWords: 0, slides: [] };
 
     // History
     case 'SET_HISTORY':
@@ -149,6 +215,10 @@ function quizReducer(state, action) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
 export function QuizProvider({ children }) {
   const [state, dispatch] = useReducer(quizReducer, initialState);
 
@@ -157,6 +227,9 @@ export function QuizProvider({ children }) {
     dispatch({ type: 'UPLOAD_START' });
     try {
       const data = await api.uploadFile(file);
+      // Persist to sessionStorage BEFORE dispatching so the reducer always
+      // has a matching entry in storage once UPLOAD_SUCCESS fires.
+      saveSession(data);
       dispatch({ type: 'UPLOAD_SUCCESS', payload: data });
       return data;
     } catch (err) {
@@ -169,7 +242,12 @@ export function QuizProvider({ children }) {
   const generateQuiz = useCallback(async (sessionId, questionCount, difficulty) => {
     dispatch({ type: 'GENERATE_START' });
 
+    console.log('[generateQuiz] START — sessionId:', sessionId,
+      '| questionCount:', questionCount, '| difficulty:', difficulty);
+
     // Simulate visual progress steps while the real API call runs in parallel.
+    // A cancelled flag stops the loop immediately if the API call fails,
+    // preventing stale GENERATE_PROGRESS dispatches after GENERATE_ERROR fires.
     const steps = [
       { progress: 10, status: 'Analyzing presentation content…' },
       { progress: 25, status: 'Extracting key concepts…' },
@@ -180,8 +258,10 @@ export function QuizProvider({ children }) {
       { progress: 95, status: 'Finalizing your quiz…' },
     ];
 
+    let cancelled = false;
     const progressPromise = (async () => {
       for (const step of steps) {
+        if (cancelled) break;
         dispatch({ type: 'GENERATE_PROGRESS', payload: step });
         await new Promise((r) => setTimeout(r, 600 + Math.random() * 400));
       }
@@ -189,6 +269,7 @@ export function QuizProvider({ children }) {
 
     try {
       const data = await api.generateQuiz(sessionId, questionCount, difficulty);
+      console.log('[generateQuiz] SUCCESS — questions received:', data?.questions?.length);
 
       // Let the progress animation finish before revealing the quiz screen.
       await progressPromise;
@@ -203,6 +284,10 @@ export function QuizProvider({ children }) {
 
       return data;
     } catch (err) {
+      cancelled = true; // stop the background progress loop immediately
+      console.error('[generateQuiz] ERROR —', err.message);
+      // Stay on the generating screen and show the error there so the user
+      // can read it, instead of silently bouncing back to the configure page.
       dispatch({ type: 'GENERATE_ERROR', payload: err.message });
       throw err;
     }
@@ -232,6 +317,7 @@ export function QuizProvider({ children }) {
 
   // ── resetQuiz ───────────────────────────────────────────────────────────
   const resetQuiz = useCallback(() => {
+    clearSession();          // wipe sessionStorage before state reset
     dispatch({ type: 'RESET' });
   }, []);
 

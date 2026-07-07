@@ -113,17 +113,111 @@ Return exactly {question_count} objects. correctAnswer must be an integer 0, 1, 
 # Response parsing and validation
 # ---------------------------------------------------------------------------
 
+def _normalize_json_payload(raw: str) -> str:
+    """Escape literal newlines and control characters inside JSON string literals."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in raw:
+        if in_string:
+            if escaped:
+                result.append(char)
+                escaped = False
+                continue
+
+            if char == "\\":
+                result.append(char)
+                escaped = True
+                continue
+
+            if char == '"':
+                result.append(char)
+                in_string = False
+                continue
+
+            if char == "\n":
+                result.append("\\n")
+                continue
+
+            if char == "\r":
+                result.append("\\r")
+                continue
+
+            if char == "\t":
+                result.append("\\t")
+                continue
+
+            if ord(char) < 32:
+                result.append(f"\\u{ord(char):04x}")
+                continue
+
+            result.append(char)
+        else:
+            if char == '"':
+                in_string = True
+            result.append(char)
+
+    return "".join(result)
+
+
 def _extract_json_array(raw: str) -> str:
-    """Extract the first JSON array from the model response, handling fences."""
+    """Extract the first JSON array from the model response, handling fences and formatting issues."""
     raw = re.sub(r"```(?:json)?\s*", "", raw)
     raw = re.sub(r"```\s*", "", raw)
     raw = raw.strip()
 
-    if raw.startswith("["):
+    if not raw:
         return raw
 
+    if raw.startswith("["):
+        return _normalize_json_payload(raw)
+
     match = re.search(r"\[.*\]", raw, re.DOTALL)
-    return match.group() if match else raw
+    if match:
+        candidate = match.group()
+        return _normalize_json_payload(candidate)
+
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start : end + 1]
+        return _normalize_json_payload(candidate)
+
+    return _normalize_json_payload(raw)
+
+
+def _repair_json_like_payload(candidate: str) -> str:
+    """Convert JSON-like content from the model into strict JSON syntax."""
+
+    def quote_keys(match: re.Match[str]) -> str:
+        return f'{match.group(1)}"{match.group(2)}"{match.group(3)}'
+
+    repaired = re.sub(r"([\[{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", quote_keys, candidate)
+    repaired = re.sub(
+        r"(?<![\\])'([^'\\]*(?:\\.[^'\\]*)*)'",
+        lambda m: '"' + m.group(1).replace('\\', '\\\\').replace('"', '\\"') + '"',
+        repaired,
+    )
+    repaired = repaired.replace("True", "true").replace("False", "false").replace("None", "null")
+    return repaired
+
+
+def _parse_json_array(raw: str) -> list[dict]:
+    """Parse a JSON array, even when the model emits JSON-like content with unquoted keys."""
+    candidate = _extract_json_array(raw)
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = _repair_json_like_payload(candidate)
+        parsed = json.loads(repaired)
+
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        return parsed
+    raise ValueError("AI response is not a JSON array.")
 
 
 def _validate_questions(questions: list) -> None:
@@ -250,9 +344,8 @@ def generate_quiz(
     }
 
     try:
-        json_str = _extract_json_array(raw_content)
-        questions = json.loads(json_str)
-    except json.JSONDecodeError as exc:
+        questions = _parse_json_array(raw_content)
+    except (json.JSONDecodeError, SyntaxError, ValueError, TypeError) as exc:
         logger.error("JSON parse failed. Raw: %s", raw_content[:500])
         raise Exception(f"AI returned malformed JSON. Please retry. Error: {exc}") from exc
 

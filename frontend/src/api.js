@@ -92,7 +92,16 @@ export async function uploadFile(file) {
   body.append('file', file);
   // Do NOT set Content-Type manually — the browser sets multipart/form-data
   // with the correct boundary automatically when the body is FormData.
-  return request('/api/upload', { method: 'POST', body });
+  console.debug('[api] POST /api/upload — file:', file.name, `(${(file.size / 1024).toFixed(1)} KB)`);
+  const data = await request('/api/upload', { method: 'POST', body });
+  console.debug('[api] Upload response:', {
+    session_id:  data.session_id,
+    filename:    data.filename,
+    slide_count: data.slide_count,
+    total_words: data.total_words,
+    slides_count: data.slides?.length,
+  });
+  return data;
 }
 
 /**
@@ -103,15 +112,20 @@ export async function uploadFile(file) {
  * @returns {Promise<{session_id, questions[], total_questions, difficulty}>}
  */
 export async function generateQuiz(sessionId, questionCount, difficulty) {
-  return request('/api/generate-quiz', {
+  const payload = {
+    session_id:     sessionId,
+    question_count: questionCount,
+    difficulty,
+  };
+  console.debug('[api] POST /api/generate-quiz — payload:', payload);
+  const data = await request('/api/generate-quiz', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      session_id: sessionId,
-      question_count: questionCount,
-      difficulty,
-    }),
+    body: JSON.stringify(payload),
   });
+  console.debug('[api] Generate response: questions_count =', data.questions?.length,
+    '| difficulty =', data.difficulty, '| session_id =', data.session_id);
+  return data;
 }
 
 /**
@@ -121,6 +135,7 @@ export async function generateQuiz(sessionId, questionCount, difficulty) {
  * @returns {Promise<{score, total_questions, percentage, passed, results[]}>}
  */
 export async function submitQuiz(sessionId, answers) {
+  console.debug('[api] POST /api/submit-quiz — session_id:', sessionId, '| answers:', answers);
   return request('/api/submit-quiz', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

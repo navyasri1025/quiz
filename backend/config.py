@@ -47,7 +47,7 @@ HISTORY_MAX_ENTRIES: int = 200                       # raised cap
 # OpenRouter / DeepSeek AI
 # ---------------------------------------------------------------------------
 OPENROUTER_API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL: str = "deepseek/deepseek-chat-v3-0324:free"
+OPENROUTER_MODEL: str = "tencent/hy3:free"
 AI_REQUEST_TIMEOUT_SECONDS: int = 120
 AI_MAX_TOKENS: int = 8192
 AI_TEMPERATURE: float = 0.7

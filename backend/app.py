@@ -162,6 +162,10 @@ def upload_file():
             "clean_text":        clean_text,
             "file_processing_time": proc_time,
         }
+        logger.info(
+            "[UPLOAD] Session stored: %s | total sessions in memory: %d",
+            session_id, len(quiz_sessions),
+        )
 
         log_upload(
             filename=filename,
@@ -215,6 +219,11 @@ def generate_quiz_route():
     session_id = data.get("session_id")
     difficulty  = data.get("difficulty", "medium")
 
+    logger.info(
+        "[GENERATE] Received — session_id=%s  difficulty=%s  question_count=%s",
+        session_id, difficulty, data.get("question_count"),
+    )
+
     try:
         question_count = int(data.get("question_count", config.DEFAULT_QUESTIONS))
     except (TypeError, ValueError):
@@ -223,7 +232,14 @@ def generate_quiz_route():
     if not session_id:
         return _err("Missing session_id. Upload a file first.")
     if session_id not in quiz_sessions:
+        logger.warning(
+            "[GENERATE] session_id NOT FOUND: %s | active sessions (%d): %s",
+            session_id,
+            len(quiz_sessions),
+            list(quiz_sessions.keys())[:10],   # cap at 10 so logs stay readable
+        )
         return _err("Session not found or expired. Re-upload your file.")
+    logger.info("[GENERATE] session_id found: %s", session_id)
     if not (config.MIN_QUESTIONS <= question_count <= config.MAX_QUESTIONS):
         return _err(f"question_count must be {config.MIN_QUESTIONS}–{config.MAX_QUESTIONS}.")
     if difficulty not in config.VALID_DIFFICULTIES:
@@ -589,4 +605,7 @@ if __name__ == "__main__":
     logger.info("  OpenRouter key  : %s", key_ok)
     logger.info("  Supported types : %s", ", ".join(sorted(config.ALLOWED_EXTENSIONS)))
     logger.info("=" * 60)
-    app.run(host="0.0.0.0", port=config.PORT, debug=config.FLASK_DEBUG)
+    # use_reloader=False prevents Werkzeug from spawning a second worker
+    # process on every file-save.  Without this, quiz_sessions (an in-memory
+    # dict) is wiped on each reload, causing "Session not found or expired".
+    app.run(host="0.0.0.0", port=config.PORT, debug=config.FLASK_DEBUG, use_reloader=False)
